@@ -2,9 +2,13 @@ package main
 
 import (
 	"fmt"
+
+	"github.com/ian-kent/gptchat/ui"
 	"github.com/ian-kent/gptchat/util"
-	"github.com/sashabaranov/go-openai"
+
 	"time"
+
+	"github.com/sashabaranov/go-openai"
 )
 
 var systemPrompt = `You are a helpful assistant.
@@ -62,4 +66,19 @@ func appendMessage(role string, message string) {
 
 func resetConversation() {
 	conversation = []openai.ChatCompletionMessage{}
+}
+func initConversation() {
+	appendMessage(openai.ChatMessageRoleSystem, systemPrompt)
+	if cfg.IsDebugMode() {
+		ui.PrintChatDebug(ui.System, systemPrompt)
+	}
+
+	appendMessage(openai.ChatMessageRoleUser, openingPrompt)
+	if cfg.IsDebugMode() {
+		ui.PrintChatDebug(ui.User, openingPrompt)
+	}
+
+	if !cfg.IsDebugMode() {
+		ui.PrintChat(ui.App, "Setting up the chat environment, please wait for GPT to respond - this may take a few moments.")
+	}
 }

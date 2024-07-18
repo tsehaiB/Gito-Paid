@@ -1,3 +1,4 @@
+// main.go
 package main
 
 import (
@@ -6,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ian-kent/gptchat/config"
 	"github.com/ian-kent/gptchat/module"
 	"github.com/ian-kent/gptchat/module/memory"
 	"github.com/ian-kent/gptchat/module/plugin"
@@ -14,29 +14,9 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
-var client *openai.Client
-var cfg = config.New()
-
 func init() {
-	openaiAPIKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
-	if openaiAPIKey == "" {
-		ui.Warn("You haven't configured an OpenAI API key")
-		fmt.Println()
-		if !ui.PromptConfirm("Do you have an API key?") {
-			ui.Warn("You'll need an API key to use GPTChat")
-			fmt.Println()
-			fmt.Println("* You can get an API key at https://platform.openai.com/account/api-keys")
-			fmt.Println("* You can get join the GPT-4 API waitlist at https://openai.com/waitlist/gpt-4-api")
-			os.Exit(1)
-		}
-
-		openaiAPIKey = ui.PromptInput("Enter your API key:")
-		if openaiAPIKey == "" {
-			fmt.Println("")
-			ui.Warn("You didn't enter an API key.")
-			os.Exit(1)
-		}
-	}
+	// Directly assign the API key
+	openaiAPIKey := "sk-proj-PK9VxsilcXQbNaG542njT3BlbkFJRmMNidriFDnlnyC61lAg"
 
 	cfg = cfg.WithOpenAIAPIKey(openaiAPIKey)
 
@@ -44,7 +24,6 @@ func init() {
 
 	if openaiAPIModel == "" {
 		ui.Warn("You haven't configured an OpenAI API model, defaulting to GPT4")
-
 		openaiAPIModel = openai.GPT4
 	}
 
@@ -81,11 +60,6 @@ func init() {
 }
 
 func main() {
-	ui.Welcome(
-		`Welcome to the GPT client.`,
-		`You can talk directly to GPT, or you can use /commands to interact with the client.
-
-Use /help to see a list of available commands.`)
-
-	chatLoop(cfg)
+	initConversation()
+	startServer()
 }
