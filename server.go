@@ -75,6 +75,7 @@ func processChat(userInput string) string {
 					Messages: conversation,
 				},
 			)
+			print(cfg.OpenAIAPIModel())
 		}
 		if err != nil {
 			fmt.Println("Error processing chat:", err)

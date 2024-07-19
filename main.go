@@ -16,16 +16,17 @@ import (
 
 func init() {
 	// Directly assign the API key
-	openaiAPIKey := "sk-proj-PK9VxsilcXQbNaG542njT3BlbkFJRmMNidriFDnlnyC61lAg"
+	openaiAPIKey := "sk-proj-TWHXQ8Xl2Rdg00tVYDCgT3BlbkFJtfWMpYYGCoNh3sqUeSz2"
 
 	cfg = cfg.WithOpenAIAPIKey(openaiAPIKey)
 
-	openaiAPIModel := strings.TrimSpace(os.Getenv("OPENAI_API_MODEL"))
-
-	if openaiAPIModel == "" {
-		ui.Warn("You haven't configured an OpenAI API model, defaulting to GPT4")
-		openaiAPIModel = openai.GPT4
-	}
+	// Ensure the model is set to GPT-4o
+	openaiAPIModel := "gpt-4o"
+	cfg = cfg.WithOpenAIAPIModel(openaiAPIModel)
+	// if openaiAPIModel == "" {
+	// 	ui.Warn("You haven't configured an OpenAI API model, defaulting to GPT4")
+	// 	openaiAPIModel = openai.GPT40314
+	// }
 
 	cfg = cfg.WithOpenAIAPIModel(openaiAPIModel)
 
