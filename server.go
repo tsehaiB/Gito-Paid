@@ -67,7 +67,7 @@ func callGemini(message string) (string, error) {
 	validTags := []string{"Investigating model", "Asking for advice", "Talking about Time"}
 
 	// Define the Gemini API endpoint and API key
-	geminiAPIKey := "AIzaSyCYCs1nbDHOjTMvEI46V6hyEqIiJcwbKTY" // Replace with your actual API key
+	geminiAPIKey := "" // Replace with your actual API key
 	geminiAPIURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 	geminiprompt := fmt.Sprintf(`You are a tag generator. Your task is to analyze the following message and determine if it matches any of these tags: "Investigating model", "Asking for advice", "Talking about Time". 
 - Only reply with tags if they are completely relevant to the message.
