@@ -2,9 +2,10 @@ package main
 
 import (
 	"github.com/ian-kent/gptchat/config"
-
-	"github.com/sashabaranov/go-openai"
+	"net/http"
 )
 
-var client *openai.Client
+var (
+    client *http.Client // Change from *openai.Client to *http.Client
+)
 var cfg = config.New()

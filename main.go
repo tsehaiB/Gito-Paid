@@ -3,25 +3,29 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
+	"time" // Add this line
 
 	"github.com/ian-kent/gptchat/module"
 	"github.com/ian-kent/gptchat/module/memory"
 	"github.com/ian-kent/gptchat/module/plugin"
 	"github.com/ian-kent/gptchat/ui"
-	openai "github.com/sashabaranov/go-openai"
 )
 
 func init() {
 	// Directly assign the API key
-	openaiAPIKey := "sk-proj-TWHXQ8Xl2Rdg00tVYDCgT3BlbkFJtfWMpYYGCoNh3sqUeSz2"
+	openaiAPIKey := "tgp_v1_Rncb_Hl4fxnXzdHNUrEMkHud7D6SK7yRU9dvF2K_a58" // Replace with your actual API key
 
 	cfg = cfg.WithOpenAIAPIKey(openaiAPIKey)
 
 	// Ensure the model is set to GPT-4o
-	openaiAPIModel := "gpt-4o"
+	openaiAPIModel := "deepseek-ai/DeepSeek-V3"
 	cfg = cfg.WithOpenAIAPIModel(openaiAPIModel)
 	// if openaiAPIModel == "" {
 	// 	ui.Warn("You haven't configured an OpenAI API model, defaulting to GPT4")
@@ -48,19 +52,47 @@ func init() {
 		}
 	}
 
-	client = openai.NewClient(openaiAPIKey)
+	client = &http.Client{Timeout: time.Minute} // Initialize HTTP client
 
-	module.Load(cfg, client, []module.Module{
+	// Load modules with a nil client (if the client isn't used)
+	module.Load(cfg, nil, []module.Module{
 		&memory.Module{},
 		&plugin.Module{},
 	}...)
 
+	// Load compiled plugins
 	if err := module.LoadCompiledPlugins(); err != nil {
 		ui.Warn(fmt.Sprintf("error loading compiled plugins: %s", err))
 	}
-}
 
+}
 func main() {
-	initConversation()
+	// initConversation()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Application encountered a critical error: %v", r)
+			dumpConversations() // Dump conversations to a file
+			//sendErrorEmail(fmt.Sprintf("Application encountered a critical error: %v", r))
+			os.Exit(1) // Exit with a non-zero status to indicate failure
+		}
+	}()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigs
+		log.Printf("Received signal: %v", sig)
+		dumpConversations() // Dump conversations to a file
+		os.Exit(0)          // Exit gracefully
+	}()
+	if _, err := os.Stat("conversation.json"); err == nil {
+		log.Println("conversation.json found, importing conversations.")
+		importConversations()
+	} else {
+		log.Println("conversation.json not found, initializing new conversation.")
+		initConversation("Config")
+	}
+	startServer()
 	startServer()
 }
