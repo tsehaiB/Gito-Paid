@@ -20,7 +20,7 @@ import (
 
 func init() {
 	// Directly assign the API key
-	openaiAPIKey := "tgp_v1_Rncb_Hl4fxnXzdHNUrEMkHud7D6SK7yRU9dvF2K_a58" // Replace with your actual API key
+	openaiAPIKey := "" // Replace with your actual API key
 
 	cfg = cfg.WithOpenAIAPIKey(openaiAPIKey)
 
