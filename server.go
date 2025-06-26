@@ -1025,24 +1025,13 @@ func callGeminiWithFiles(messages []openai.ChatCompletionMessage, files []struct
 	Content []byte
 	Type    string
 }) (string, error) {
-	var parts []struct {
-		Text       string `json:"text,omitempty"`
-		InlineData *struct {
-			MimeType string `json:"mimeType"`
-			Data     string `json:"data"`
-		} `json:"inlineData,omitempty"`
-	}
+	// Convert parts to []interface{}
+	var parts []interface{}
 
 	// Convert messages to text parts
 	for _, msg := range messages {
-		parts = append(parts, struct {
-			Text       string `json:"text,omitempty"`
-			InlineData *struct {
-				MimeType string `json:"mimeType"`
-				Data     string `json:"data"`
-			} `json:"inlineData,omitempty"`
-		}{
-			Text: fmt.Sprintf("%s: %s", msg.Role, msg.Content),
+		parts = append(parts, map[string]interface{}{
+			"text": fmt.Sprintf("%s: %s", msg.Role, msg.Content),
 		})
 	}
 
@@ -1053,39 +1042,33 @@ func callGeminiWithFiles(messages []openai.ChatCompletionMessage, files []struct
 			mimeType = "application/octet-stream"
 		}
 
-		parts = append(parts, struct {
-			Text       string `json:"text,omitempty"`
-			InlineData *struct {
-				MimeType string `json:"mimeType"`
-				Data     string `json:"data"`
-			} `json:"inlineData,omitempty"`
-		}{
-			InlineData: &struct {
-				MimeType string `json:"mimeType"`
-				Data     string `json:"data"`
-			}{
-				MimeType: mimeType,
-				Data:     base64.StdEncoding.EncodeToString(file.Content),
+		parts = append(parts, map[string]interface{}{
+			"inlineData": map[string]string{
+				"mimeType": mimeType,
+				"data":     base64.StdEncoding.EncodeToString(file.Content),
 			},
 		})
 	}
 
-	reqBody := struct {
-		Contents []struct {
-			Parts []interface{} `json:"parts"`
-		} `json:"contents"`
-	}{
-		Contents: []struct {
-			Parts []interface{} `json:"parts"`
-		}{
-			{Parts: parts},
+	reqBody := map[string]interface{}{
+		"contents": []interface{}{
+			map[string]interface{}{
+				"parts": parts,
+			},
 		},
 	}
 
-	bodyBytes, _ := json.Marshal(reqBody)
-	req, _ := http.NewRequest("POST",
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("error marshaling request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST",
 		"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent",
 		bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("error creating request: %w", err)
+	}
 
 	q := req.URL.Query()
 	q.Add("key", cfg.GeminiAPIKey())
@@ -1118,7 +1101,6 @@ func callGeminiWithFiles(messages []openai.ChatCompletionMessage, files []struct
 
 	return result.Candidates[0].Content.Parts[0].Text, nil
 }
-
 func processChat(userID, userInput string, files []struct {
 	Name    string
 	Content []byte
