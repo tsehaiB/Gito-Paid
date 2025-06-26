@@ -20,8 +20,7 @@ import (
 
 func init() {
 	// Directly assign the API key
-	openaiAPIKey := "tgp_v1_Rncb_Hl4fxnXzdHNUrEMkHud7D6SK7yRU9dvF2K_a58" // Replace with your actual API key
-
+	openaiAPIKey := strings.TrimSpace(cfg.OpenAIAPIKey()) // Replace with your actual API key
 	cfg = cfg.WithOpenAIAPIKey(openaiAPIKey)
 
 	// Ensure the model is set to GPT-4o
@@ -33,7 +32,8 @@ func init() {
 	// }
 
 	cfg = cfg.WithOpenAIAPIModel(openaiAPIModel)
-
+	geminiKey := strings.TrimSpace(cfg.GeminiAPIKey())
+        cfg = cfg.WithGeminiAPIKey(geminiKey)
 	supervisorMode := os.Getenv("GPTCHAT_SUPERVISOR")
 	switch strings.ToLower(supervisorMode) {
 	case "disabled":
@@ -89,10 +89,11 @@ func main() {
 	if _, err := os.Stat("conversation.json"); err == nil {
 		log.Println("conversation.json found, importing conversations.")
 		importConversations()
+                log.Println("Importing sessions")
+                restoreSessionsFromConversations()
 	} else {
 		log.Println("conversation.json not found, initializing new conversation.")
 		initConversation("Config")
 	}
-	startServer()
 	startServer()
 }
