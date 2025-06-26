@@ -2,15 +2,17 @@ package main
 
 import (
 	"bytes"
+	"html"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
-
+	"regexp"
+	"strings"
+	"github.com/russross/blackfriday/v2"
 	"github.com/ian-kent/gptchat/module"
 	"github.com/sashabaranov/go-openai"
 )
@@ -61,6 +63,131 @@ type GPTResponse struct {
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
 }
+func stripMarkdown(text string) string {
+	// Render Markdown as plaintext (no HTML tags)
+	plaintext := string(blackfriday.Run([]byte(text), blackfriday.WithExtensions(blackfriday.CommonExtensions)))
+	return plaintext
+
+}
+func normalizeWhitespace(text string) string {
+	// Replace newlines/tabs with spaces
+	text = strings.ReplaceAll(text, "\n", " ")
+	text = strings.ReplaceAll(text, "\t", " ")
+	// Collapse multiple spaces
+	spaceRegex := regexp.MustCompile(`\s+`)
+	return spaceRegex.ReplaceAllString(text, " ")
+}
+func removeEmojis(text string) string {
+	// Regex for common emoji ranges
+	emojiRegex := regexp.MustCompile(`[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{1F1E0}-\x{1F1FF}\x{2600}-\x{26FF}\x{2700}-\x{27BF}]`)
+	return emojiRegex.ReplaceAllString(text, "")
+	}
+func stripHTML(text string) string {
+	// Remove HTML tags
+	text = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(text, "")
+	// Unescape HTML entities
+	return html.UnescapeString(text)
+}
+
+func cleanContent(content string) string {
+        content = stripMarkdown(content)
+        content = removeEmojis(content)
+        content = normalizeWhitespace(content)
+        content = stripHTML(content)
+        fmt.Println("all done cleaning!")
+        return content
+}
+func reformatTextWithGemini(input string) (string, error) {
+	// Define the Gemini API endpoint and API key
+	geminiAPIKey := "AIzaSyCYCs1nbDHOjTMvEI46V6hyEqIiJcwbKTY" // Replace with your actual API key
+	geminiAPIURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent"
+
+	// Prepare the prompt with the input
+	prompt := `You are a reformatter. You take inputs, and you remove all em dashes, and any other form of dash. and in the LEAST rewriting possible, you replace them with simpler punctuation. You do not change the wording of things, but you can add new words to remove an em dash. When removing a transition word that was placed for emphasis, use transitional words to rewrite the phrasing, but keep the original words.
+
+Let no en dash or em dash escape. Remove them all! Never say anything before or after the rewritten text. Just respond with the rewritten text.
+
+Here is the text to reformat: ` + input
+
+	// Prepare the request body
+	reqBody := struct {
+		Contents []struct {
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"contents"`
+	}{
+		Contents: []struct {
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		}{
+			{
+				Parts: []struct {
+					Text string `json:"text"`
+				}{
+					{Text: prompt},
+				},
+			},
+		},
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("error marshaling request body: %v", err)
+	}
+
+	// Create the HTTP request
+	req, err := http.NewRequest("POST", geminiAPIURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("error creating request: %v", err)
+	}
+
+	// Add API key as URL parameter
+	q := req.URL.Query()
+	q.Add("key", geminiAPIKey)
+	req.URL.RawQuery = q.Encode()
+
+	req.Header.Set("Content-Type", "application/json")
+
+	// Send the request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("error sending request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Check for API errors
+	if resp.StatusCode != http.StatusOK {
+		errorBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API returned non-200 status: %s, body: %s", resp.Status, string(errorBody))
+	}
+
+	// Decode the response
+	var geminiResp struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
+		return "", fmt.Errorf("error decoding response: %v", err)
+	}
+
+	// Extract the response text
+	if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
+		return "", fmt.Errorf("no content in response")
+	}
+
+	// Return the reformatted text
+	return geminiResp.Candidates[0].Content.Parts[0].Text, nil
+}
+
 
 func callGemini(message string) (string, error) {
 	// Define the valid tags
@@ -68,7 +195,7 @@ func callGemini(message string) (string, error) {
 
 	// Define the Gemini API endpoint and API key
 	geminiAPIKey := "AIzaSyCYCs1nbDHOjTMvEI46V6hyEqIiJcwbKTY" // Replace with your actual API key
-	geminiAPIURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+	geminiAPIURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent"
 	geminiprompt := fmt.Sprintf(`You are a tag generator. Your task is to analyze the following message and determine if it matches any of these tags: "Investigating model", "Asking for advice", "Talking about Time". 
 - Only reply with tags if they are completely relevant to the message.
 - If no tags are relevant, reply with "NONE".
@@ -214,8 +341,7 @@ func processChat(userID, userInput string) string {
 		// Otherwise, combinedSlice is the appended slice of conversations["Config"] and conversations[userID]
 		combinedSlice = append(conversations["Config"], conversations[userID]...)
 	}
-
-	if !strings.Contains(userID, "decision") {
+	if (false) {
 		// Call Gemini to get tags for the user input
 		tags, err := callGemini(userInput)
 		if err != nil {
@@ -250,7 +376,6 @@ func processChat(userID, userInput string) string {
 		Messages: combinedSlice,
 		Stream:   false, // Set to true if you want streaming
 	}
-
 	bodyBytes, _ := json.Marshal(reqBody)
 	req, _ := http.NewRequest("POST", "https://api.together.ai/v1/chat/completions", bytes.NewReader(bodyBytes))
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIAPIKey()) // Use the API key from cfg
@@ -288,7 +413,13 @@ func processChat(userID, userInput string) string {
 
 	// Append AI response to conversation
 	response := apiResult.Choices[0].Message.Content
-	appendMessage(userID, openai.ChatMessageRoleAssistant, response)
+	formResponse, err := reformatTextWithGemini(response)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	}
+	fmt.Println("Reformatted text:", formResponse)
+	response = formResponse
+	appendMessage(userID, openai.ChatMessageRoleAssistant, cleanContent(response))
 
 	return response
 }
