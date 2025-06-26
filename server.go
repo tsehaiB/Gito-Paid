@@ -1,26 +1,27 @@
 
 package main
 
-import (
-	"strconv"
-        "net/url"
-        "unicode"
-        "unicode/utf8"
-	"context"
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"sync"
-	"time"
-	"regexp"
-	"strings"
-        "github.com/go-shiori/go-readability"
-	"github.com/sashabaranov/go-openai"
-)
 
+import (
+    "strconv"
+
+    "net/url"
+    "unicode"
+    "unicode/utf8"
+    "context"
+    "bytes"
+    "encoding/json"
+    "fmt"
+    "io"
+    "log"
+    "net/http"
+    "sync"
+    "time"
+    "regexp"
+    "strings"
+    "github.com/go-shiori/go-readability"
+    "github.com/sashabaranov/go-openai"
+)
 var (
 	conversationMutex sync.Mutex
 )
