@@ -1,8 +1,13 @@
+
 package main
 
 import (
+	"strconv"
+        "net/url"
+        "unicode"
+        "unicode/utf8"
+	"context"
 	"bytes"
-	"html"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,14 +17,35 @@ import (
 	"time"
 	"regexp"
 	"strings"
-	"github.com/russross/blackfriday/v2"
-	"github.com/ian-kent/gptchat/module"
+        "github.com/go-shiori/go-readability"
 	"github.com/sashabaranov/go-openai"
 )
 
 var (
 	conversationMutex sync.Mutex
 )
+// --- Session Management ---
+type UserSession struct {
+    ID                string    // Format: "User123#S<timestamp>-<sequence>"
+    Active            bool
+    Timer             *time.Timer
+    UserTotalSessions int       // Total sessions for this user
+    LastSessionTime   int64     // Unix timestamp of last session creation
+}
+var (
+    sessions   = make(map[string]*UserSession) // userID → UserSession
+    sessionMux sync.Mutex
+)
+
+const (
+    SessionTimeout = 1 * time.Minute // Test with 3 minutes
+)
+var sentenceAbbrevs = map[string]bool{
+        "vs.": true, "e.g.": true, "i.e.": true, "Dr.": true,
+        "Prof.": true, "Mr.": true, "Mrs.": true, "Ms.": true,
+        "U.S.": true, "Ph.D.": true, "A.D.": true, "B.C.": true,
+        "etc.": true, "cf.": true, "ex.": true, "approx.": true,
+    }
 
 // Define the types globally
 type GenerateRequest struct {
@@ -63,324 +89,1047 @@ type GPTResponse struct {
 		TotalTokens      int `json:"total_tokens"`
 	} `json:"usage"`
 }
-func stripMarkdown(text string) string {
-	// Render Markdown as plaintext (no HTML tags)
-	plaintext := string(blackfriday.Run([]byte(text), blackfriday.WithExtensions(blackfriday.CommonExtensions)))
-	return plaintext
+func restoreSessionsFromConversations() {
+    conversationMutex.Lock()
+    defer conversationMutex.Unlock()
+    sessionMux.Lock()
+    defer sessionMux.Unlock()
 
-}
-func normalizeWhitespace(text string) string {
-	// Replace newlines/tabs with spaces
-	text = strings.ReplaceAll(text, "\n", " ")
-	text = strings.ReplaceAll(text, "\t", " ")
-	// Collapse multiple spaces
-	spaceRegex := regexp.MustCompile(`\s+`)
-	return spaceRegex.ReplaceAllString(text, " ")
-}
-func removeEmojis(text string) string {
-	// Regex for common emoji ranges
-	emojiRegex := regexp.MustCompile(`[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{1F1E0}-\x{1F1FF}\x{2600}-\x{26FF}\x{2700}-\x{27BF}]`)
-	return emojiRegex.ReplaceAllString(text, "")
-	}
-func stripHTML(text string) string {
-	// Remove HTML tags
-	text = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(text, "")
-	// Unescape HTML entities
-	return html.UnescapeString(text)
+    // Clear existing sessions to avoid duplicates
+    sessions = make(map[string]*UserSession)
+
+    for key := range conversations {
+        // Skip summary entries and system config
+        if strings.HasPrefix(key, "SUM_") || key == "Config" {
+            continue
+        }
+
+        // Extract userID from conversation key (format: "userID#Stimestamp-seq")
+        parts := strings.Split(key, "#S")
+        if len(parts) != 2 {
+            continue // Invalid format
+        }
+        userID := parts[0]
+
+        // Extract timestamp and sequence from the session part
+        sessionParts := strings.Split(parts[1], "-")
+        if len(sessionParts) != 2 {
+            continue // Invalid format
+        }
+
+        timestamp, err := strconv.ParseInt(sessionParts[0], 10, 64)
+        if err != nil {
+            continue // Invalid timestamp
+        }
+
+        seq, err := strconv.Atoi(sessionParts[1])
+        if err != nil {
+            continue // Invalid sequence
+        }
+
+        // Get or create user session
+        session, exists := sessions[userID]
+        if !exists {
+            session = &UserSession{
+                ID:                key,
+                Active:            false, // Restored sessions start inactive
+                UserTotalSessions: seq,
+                LastSessionTime:   timestamp,
+            }
+            sessions[userID] = session
+        } else {
+            // Update if this is a more recent session
+            if seq > session.UserTotalSessions {
+                session.UserTotalSessions = seq
+                session.ID = key
+                session.LastSessionTime = timestamp
+            }
+        }
+    }
+
+    // Log restoration results
+    log.Printf("Restored %d user sessions from conversations", len(sessions))
 }
 
-func cleanContent(content string) string {
-        content = stripMarkdown(content)
-        content = removeEmojis(content)
-        content = normalizeWhitespace(content)
-        content = stripHTML(content)
-        fmt.Println("all done cleaning!")
-        return content
+
+// Called on every AI response
+
+func startSessionTimer(userID string) {
+    sessionMux.Lock()
+    defer sessionMux.Unlock()
+
+    session, exists := sessions[userID]
+    if !exists {
+        // Initialize new user session with timestamped ID
+        session = &UserSession{
+            ID:               fmt.Sprintf("%s#S%d-1", userID, time.Now().Unix()), // "User123#S1624291200-1"
+            Active:           true,
+            UserTotalSessions: 1,
+            LastSessionTime:   time.Now().Unix(),
+        }
+        sessions[userID] = session
+        fmt.Printf("[DEBUG] New session %s for %s (Total: %d)\n", 
+            session.ID, userID, session.UserTotalSessions)
+    } else {
+        // Existing user: Only increment if session was inactive
+        if !session.Active {
+	    session.Active = true 
+            session.UserTotalSessions++
+            session.ID = fmt.Sprintf("%s#S%d-%d", 
+                userID, 
+                time.Now().Unix(), 
+                session.UserTotalSessions) // "User123#S1624291300-2"
+            session.LastSessionTime = time.Now().Unix()
+            fmt.Printf("[DEBUG] New session %s for %s (Total: %d)\n", 
+                session.ID, userID, session.UserTotalSessions)
+        }
+    }
+
+    // Reset timer (existing logic)
+    if session.Timer != nil {
+        session.Timer.Stop()
+    }
+    session.Timer = time.AfterFunc(SessionTimeout, func() {
+        expireSession(userID)
+    })
+    fmt.Printf("[DEBUG] Timer reset for %s (Active: %v)\n", 
+        userID, session.Active)
+}
+
+func expireSession(userID string) {
+    // Lock ONLY session state
+    sessionMux.Lock()
+    session := sessions[userID]
+    session.Active = false
+    sessionMux.Unlock() // Release early!
+
+    // Prepare summary outside the lock
+    summaryKey := fmt.Sprintf("SUM_%s", session.ID)
+    placeholder := []openai.ChatCompletionMessage{
+        {Role: openai.ChatMessageRoleSystem, Content: "[PENDING_SUMMARY]"},
+    }
+
+    // Lock conversations ONLY for the write
+    conversationMutex.Lock()
+    conversations[summaryKey] = placeholder
+    conversationMutex.Unlock()
+
+    rawMessages := conversations[session.ID] // Copy to avoid mutex issues
+    go summarizeSession(session.ID, rawMessages)
+
+
+    fmt.Printf("[ARCHIVE] Stored summary for %s (Mutex safe)\n", summaryKey)
+}
+func buildContext(userID string) []openai.ChatCompletionMessage {
+    // First get session info with session lock
+    sessionMux.Lock()
+    session, exists := sessions[userID]
+    if !exists {
+        sessionMux.Unlock()
+        return []openai.ChatCompletionMessage{}
+    }
+    totalSessions := session.UserTotalSessions
+    currentSessionID := session.ID
+    sessionMux.Unlock()
+
+    // Now lock conversations for building context
+    conversationMutex.Lock()
+    defer conversationMutex.Unlock()
+
+    ctx := []openai.ChatCompletionMessage{}
+
+    // 1. Always add Config first
+    if config, exists := conversations["Config"]; exists {
+        ctx = append(ctx, config...)
+    }
+
+    // 2. Add summaries for previous sessions (up to N-1)
+    for i := 1; i < totalSessions; i++ {
+        // Construct summary key pattern
+        sumKey := fmt.Sprintf("SUM_%s#S", userID)
+        fmt.Printf(sumKey)
+        for key, messages := range conversations {
+            if strings.HasPrefix(key, sumKey) {
+                // Extract sequence number from key like "SUM_user#Stimestamp-seq"
+                parts := strings.Split(key, "-")
+                if len(parts) == 2 {
+                    seq, err := strconv.Atoi(parts[1])
+                    if err == nil && seq == i {
+                        ctx = append(ctx, messages...)
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Add previous session (N-1) if exists
+    if totalSessions > 1 {
+        prevKey := fmt.Sprintf("%s#S", userID)
+        fmt.Printf(prevKey)
+        for key, messages := range conversations {
+            if strings.HasPrefix(key, prevKey) && !strings.HasPrefix(key, "SUM_") {
+                // Extract sequence number
+                parts := strings.Split(key, "-")
+                if len(parts) == 2 {
+                    seq, err := strconv.Atoi(parts[1])
+                    if err == nil && seq == totalSessions-1 {
+                        ctx = append(ctx, messages...)
+                        break
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Add current session messages
+    if currentMessages, exists := conversations[currentSessionID]; exists {
+        ctx = append(ctx, currentMessages...)
+    }
+
+    return ctx
+}
+func callGeminiAPI(prompt string) (string, error) {
+    reqBody := struct {
+        Contents []struct {
+            Parts []struct {
+                Text string `json:"text"`
+            } `json:"parts"`
+        } `json:"contents"`
+    }{
+        Contents: []struct {
+            Parts []struct {
+                Text string `json:"text"`
+            } `json:"parts"`
+        }{
+            {
+                Parts: []struct {
+                    Text string `json:"text"`
+                }{
+                    {Text: prompt},
+                },
+            },
+        },
+    }
+
+    bodyBytes, _ := json.Marshal(reqBody)
+    geminiEndpoint := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent"
+    req, _ := http.NewRequest("POST", geminiEndpoint, bytes.NewReader(bodyBytes))
+    req.Header.Set("Content-Type", "application/json")
+    q := req.URL.Query()
+    q.Add("key", cfg.GeminiAPIKey())
+    req.URL.RawQuery = q.Encode()
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return "", err
+    }
+    defer resp.Body.Close()
+
+    var result struct {
+        Candidates []struct {
+            Content struct {
+                Parts []struct {
+                    Text string `json:"text"`
+                } `json:"parts"`
+            } `json:"content"`
+        } `json:"candidates"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return "", err
+    }
+
+    if len(result.Candidates) == 0 {
+        return "", fmt.Errorf("no Gemini response")
+    }
+
+    return result.Candidates[0].Content.Parts[0].Text, nil
+}
+func buildSummaryPrompt(messages []openai.ChatCompletionMessage) string {
+    var sb strings.Builder
+    sb.WriteString("Summarize this conversation in 1-2 sentences for future context. Focus on:\n")
+    sb.WriteString("- Key user requests/questions\n")
+    sb.WriteString("- Technical details (e.g., code snippets)\n")
+    sb.WriteString("- Preferences/tone\n\n")
+    sb.WriteString("Conversation:\n")
+    
+    for _, msg := range messages {
+        sb.WriteString(fmt.Sprintf("%s: %s\n", msg.Role, msg.Content))
+    }
+    
+    sb.WriteString("\nRespond ONLY with the summary, no prefixes.")
+    return sb.String()
+}
+// Handles async summarization and placeholder replacement
+func summarizeSession(sessionID string, rawMessages []openai.ChatCompletionMessage) {
+    go func() {
+        // 1. Call Gemini
+        prompt := buildSummaryPrompt(rawMessages) // (See prompt template below)
+        summary, err := callGeminiAPI(prompt)
+        if err != nil {
+            log.Printf("[GEMINI] Summarization failed: %v", err)
+            summary = fmt.Sprintf("[ERROR_SUMMARY] %s", err.Error())
+        }
+
+        // 2. Atomic replacement
+        conversationMutex.Lock()
+        defer conversationMutex.Unlock()
+        conversations["SUM_"+sessionID] = []openai.ChatCompletionMessage{
+            {
+                Role:    "system",
+                Content: summary,
+            },
+        }
+        fmt.Printf("[GEMINI] Replaced summary for %s\n", sessionID)
+    }()
+}
+func callSearxng(query string, links []string) ([]string, error) {
+    var allContents []string
+    
+    // 1. First perform the regular web search
+    searxngURL := "https://lina.infogito.com/search"
+    req, err := http.NewRequest("GET", searxngURL, nil)
+    if err != nil {
+        return nil, fmt.Errorf("error creating request: %v", err)
+    }
+
+    q := req.URL.Query()
+    q.Add("q", query)
+    q.Add("format", "json")
+    q.Add("limit", "5")
+    req.URL.RawQuery = q.Encode()
+
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("error calling SearxNG: %v", err)
+    }
+    defer resp.Body.Close()
+
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, fmt.Errorf("error reading response: %v", err)
+    }
+
+    var result struct {
+        Results []struct {
+            Content string `json:"content"`
+        } `json:"results"`
+    }
+
+    if err := json.Unmarshal(body, &result); err != nil {
+        return nil, fmt.Errorf("error parsing JSON: %v", err)
+    }
+
+    // Add regular search results
+    for i, res := range result.Results {
+        if i >= 5 {
+            break
+        }
+        allContents = append(allContents, fmt.Sprintf("Search result %d: %s", i+1, res.Content))
+    }
+
+    // 2. Then fetch content from any provided links
+    if len(links) > 0 {
+        fmt.Println("We have links!")
+        for _, link := range links {
+            content, err := fetchURLContent(link)
+            if err != nil {
+                log.Printf("Failed to fetch URL %s: %v", link, err)
+                continue
+            }
+            allContents = append(allContents, fmt.Sprintf("Content from link %s:\n%s", link, content))
+        }
+    }
+
+    return allContents, nil
+}
+func fetchURLContent(urlStr string) (string, error) {
+    // First parse the URL string into a *url.URL
+    parsedURL, err := url.Parse(urlStr)
+    if err != nil {
+        return "", fmt.Errorf("failed to parse URL: %v", err)
+    }
+
+    resp, err := http.Get(urlStr)
+    if err != nil {
+        return "", fmt.Errorf("failed to fetch URL: %v", err)
+    }
+    defer resp.Body.Close()
+
+    // Now pass the parsed *url.URL instead of the string
+    article, err := readability.FromReader(resp.Body, parsedURL)
+    if err != nil {
+        return "", fmt.Errorf("failed to parse content: %v", err)
+    }
+
+    return fmt.Sprintf("Title: %s\nContent: %s", article.Title, article.TextContent), nil
+}
+
+func shouldUseOriginal(original, modified string) bool {
+    // 1. Empty check
+    if original == "" || modified == "" {
+        return true
+    }
+
+    // 2. Length check (skip if you don't care)
+    lenOrig := utf8.RuneCountInString(original)
+    lenMod := utf8.RuneCountInString(modified)
+    if abs(lenOrig-lenMod) > int(0.1*float64(lenOrig)) {
+        return true
+    }
+
+    // 3. Lightning-fast alphabet-only frequency check
+    var freqDiff [256]int // Covers all ASCII letters (A-Za-z)
+
+    // Count original letters
+    for _, c := range original {
+        if c >= 'a' && c <= 'z' {
+            freqDiff[c-'a']++
+        } else if c >= 'A' && c <= 'Z' {
+            freqDiff[c-'A'+26]++ // Uppercase in second half
+        }
+    }
+
+    // Count modified letters and check diffs
+    for _, c := range modified {
+        if c >= 'a' && c <= 'z' {
+            idx := c - 'a'
+            freqDiff[idx]--
+            if freqDiff[idx] < -10 {
+                return true
+            }
+        } else if c >= 'A' && c <= 'Z' {
+            idx := c - 'A' + 26
+            freqDiff[idx]--
+            if freqDiff[idx] < -10 {
+                return true
+            }
+        }
+    }
+
+    // 4. Final sum check (if needed)
+    totalDiff := 0
+    for _, diff := range freqDiff {
+        if abs(diff) > 10 {
+            return true
+        }
+        totalDiff += abs(diff)
+    }
+    return totalDiff > 5*52 // 26 letters × 2 cases
+}
+
+func abs(x int) int {
+    if x < 0 { return -x }
+    return x
 }
 func reformatTextWithGemini(input string) (string, error) {
-	// Define the Gemini API endpoint and API key
-	geminiAPIKey := "AIzaSyCYCs1nbDHOjTMvEI46V6hyEqIiJcwbKTY" // Replace with your actual API key
-	geminiAPIURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent"
+    sentences := splitIntoSentences(input)
 
-	// Prepare the prompt with the input
-	prompt := `You are a reformatter. You take inputs, and you remove all em dashes, and any other form of dash. and in the LEAST rewriting possible, you replace them with simpler punctuation. You do not change the wording of things, but you can add new words to remove an em dash. When removing a transition word that was placed for emphasis, use transitional words to rewrite the phrasing, but keep the original words.
+    // Filter sentences that need processing
+    var sentencesToProcess []struct {
+        index int
+        text  string
+        punct rune
+    }
+    for i, s := range sentences {
+        punct := rune('.') // Default punctuation
+        if len(s) > 0 {
+            lastChar := rune(s[len(s)-1])
+            if lastChar == '.' || lastChar == '!' || lastChar == '?' {
+                punct = lastChar
+            }
+        }
+        
+        if strings.Contains(s, "—") || strings.Contains(s, "–") {
+            sentencesToProcess = append(sentencesToProcess, struct {
+                index int
+                text  string
+                punct rune
+            }{i, s, punct})
+        }
+    }
 
-Let no en dash or em dash escape. Remove them all! Never say anything before or after the rewritten text. Just respond with the rewritten text.
+    // If no sentences need processing, return early
+    if len(sentencesToProcess) == 0 {
+        return input, nil
+    } else {
+       // Extract just the text fields for logging
+        var texts []string
+        for _, stp := range sentencesToProcess {
+            texts = append(texts, stp.text)
+        }
+        fmt.Printf("Sentences sent to gemini: %s\n", strings.Join(texts, "\n"))
+    }
+    geminiAPIURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent"
+    prompt := `You are a reformatter. You take inputs, and you remove all en dashes and em dashes, you maintain the content but rewrite the structure so it does not need any em dashes, you prioritize simpler punctuation. You do not change the meaning of your input, but you can add new words to remove an em dash. When removing a em dash that was placed for emphasis, use transitional words to rewrite the phrasing, but keep the original words. Let no en dash or em dash escape. Remove them all! However, never touch a hyphen, those are fine. Hyphens should not be reformatted. When you a repunctuating an em dash, replace it with commas and periods over colons and semi colons. Never change formatting unrelated to the em dash. Never say anything before or after the rewritten text. Just respond with the rewritten text.`
 
-Here is the text to reformat: ` + input
+    // Create a worker pool with limited concurrency (adjust as needed)
+    maxConcurrent := 5 // Don't overwhelm the API
+    sem := make(chan struct{}, maxConcurrent)
+    results := make(chan struct {
+        index int
+        text  string
+        err   error
+    }, len(sentencesToProcess))
 
-	// Prepare the request body
-	reqBody := struct {
-		Contents []struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		} `json:"contents"`
-	}{
-		Contents: []struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		}{
-			{
-				Parts: []struct {
-					Text string `json:"text"`
-				}{
-					{Text: prompt},
-				},
-			},
-		},
-	}
+    var wg sync.WaitGroup
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
 
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("error marshaling request body: %v", err)
-	}
+    // Process sentences in parallel
+    for _, stp := range sentencesToProcess {
+        wg.Add(1)
+        go func(idx int, sentence string, punct rune) {
+            defer wg.Done()
 
-	// Create the HTTP request
-	req, err := http.NewRequest("POST", geminiAPIURL, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", fmt.Errorf("error creating request: %v", err)
-	}
+            select {
+            case sem <- struct{}{}:
+                defer func() { <-sem }()
+            case <-ctx.Done():
+                return
+            }
 
-	// Add API key as URL parameter
-	q := req.URL.Query()
-	q.Add("key", geminiAPIKey)
-	req.URL.RawQuery = q.Encode()
+            // Prepare and send request
+            reqBody := struct {
+                Contents []struct {
+                    Parts []struct {
+                        Text string `json:"text"`
+                    } `json:"parts"`
+                } `json:"contents"`
+            }{
+                Contents: []struct {
+                    Parts []struct {
+                        Text string `json:"text"`
+                    } `json:"parts"`
+                }{
+                    {
+                        Parts: []struct {
+                            Text string `json:"text"`
+                        }{
+                            {Text: prompt + sentence},
+                        },
+                    },
+                },
+            }
 
-	req.Header.Set("Content-Type", "application/json")
+            bodyBytes, err := json.Marshal(reqBody)
+            if err != nil {
+                results <- struct {
+                    index int
+                    text  string
+                    err   error
+                }{idx, "", fmt.Errorf("error marshaling request body: %v", err)}
+                return
+            }
 
-	// Send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("error sending request: %v", err)
-	}
-	defer resp.Body.Close()
+            req, err := http.NewRequest("POST", geminiAPIURL, bytes.NewReader(bodyBytes))
+            if err != nil {
+                results <- struct {
+                    index int
+                    text  string
+                    err   error
+                }{idx, "", fmt.Errorf("error creating request: %v", err)}
+                return
+            }
 
-	// Check for API errors
-	if resp.StatusCode != http.StatusOK {
-		errorBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API returned non-200 status: %s, body: %s", resp.Status, string(errorBody))
-	}
+            q := req.URL.Query()
+            q.Add("key", cfg.GeminiAPIKey())
+            req.URL.RawQuery = q.Encode()
+            req.Header.Set("Content-Type", "application/json")
 
-	// Decode the response
-	var geminiResp struct {
-		Candidates []struct {
-			Content struct {
-				Parts []struct {
-					Text string `json:"text"`
-				} `json:"parts"`
-			} `json:"content"`
-		} `json:"candidates"`
-	}
+            client := &http.Client{Timeout: 30 * time.Second}
+            resp, err := client.Do(req)
+            if err != nil {
+                results <- struct {
+                    index int
+                    text  string
+                    err   error
+                }{idx, "", fmt.Errorf("error sending request: %v", err)}
+                return
+            }
+            defer resp.Body.Close()
 
-	if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
-		return "", fmt.Errorf("error decoding response: %v", err)
-	}
+            if resp.StatusCode != http.StatusOK {
+                results <- struct {
+                    index int
+                    text  string
+                    err   error
+                }{idx, "", fmt.Errorf("API returned non-200 status: %s", resp.Status)}
+                return
+            }
 
-	// Extract the response text
-	if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
-		return "", fmt.Errorf("no content in response")
-	}
+            var geminiResp struct {
+                Candidates []struct {
+                    Content struct {
+                        Parts []struct {
+                            Text string `json:"text"`
+                        } `json:"parts"`
+                    } `json:"content"`
+                } `json:"candidates"`
+            }
 
-	// Return the reformatted text
-	return geminiResp.Candidates[0].Content.Parts[0].Text, nil
+            if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
+                results <- struct {
+                    index int
+                    text  string
+                    err   error
+                }{idx, "", fmt.Errorf("error decoding response: %v", err)}
+                return
+            }
+
+            if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
+                results <- struct {
+                    index int
+                    text  string
+                    err   error
+                }{idx, "", fmt.Errorf("no content in response")}
+                return
+            }
+
+            // Remove any trailing punctuation from the processed text
+            processedText := strings.TrimRight(geminiResp.Candidates[0].Content.Parts[0].Text, ".!?")
+            // Add back the original punctuation
+            finalText := processedText + string(punct)
+            
+            results <- struct {
+                index int
+                text  string
+                err   error
+            }{idx, finalText, nil}
+        }(stp.index, stp.text, stp.punct)
+    }
+
+    // Close results channel when all workers are done
+    go func() {
+        wg.Wait()
+        close(results)
+    }()
+
+    // Collect results
+    processed := make(map[int]string)
+    var firstErr error
+    for result := range results {
+        if result.err != nil && firstErr == nil {
+            firstErr = result.err
+            cancel() // Cancel remaining requests
+            continue
+        }
+        processed[result.index] = result.text
+    }
+
+    if firstErr != nil {
+        return "", firstErr
+    }
+
+    // Rebuild the text with processed sentences
+   // Rebuild the text with processed sentences while preserving newlines
+    // Rebuild the text with proper spacing
+    var result strings.Builder
+    for i, s := range sentences {
+        // Use processed version if available, otherwise original
+        if processedText, exists := processed[i]; exists {
+            result.WriteString(processedText)
+        } else {
+            result.WriteString(s)
+        }
+
+        // Handle spacing between sentences
+        if i < len(sentences)-1 {
+            next := sentences[i+1]
+            currentEndsWithSpace := len(s) > 0 && unicode.IsSpace(rune(s[len(s)-1]))
+            nextStartsWithSpace := len(next) > 0 && unicode.IsSpace(rune(next[0]))
+            
+            // Add space only if:
+            // 1. Current doesn't end with space AND
+            // 2. Next doesn't start with space AND 
+            // 3. Next isn't a newline
+            if !currentEndsWithSpace && !nextStartsWithSpace && next != "\n" {
+                result.WriteString(" ")
+            }
+        }
+    }
+    return result.String(), nil
+
+}
+func splitIntoSentences(text string) []string {
+
+    var sentences []string
+    start := 0
+    inQuote := false
+
+    for i := 0; i < len(text); i++ {
+        currChar := text[i]
+
+        // Track quote state
+        if currChar == '"' || currChar == '\'' {
+            inQuote = !inQuote
+            continue
+        }
+
+        // Handle standalone newlines
+        if currChar == '\n' && !inQuote {
+            // Add content before newline if it exists
+            if i > start {
+                sentence := text[start:i]
+                if strings.TrimSpace(sentence) != "" {
+                    sentences = append(sentences, sentence)
+                }
+            }
+            // Add the newline as a separate "sentence"
+            sentences = append(sentences, "\n")
+            start = i + 1
+            continue
+        }
+
+        // Check for sentence boundaries
+        if i > 0 {
+            prevChar := text[i-1]
+            if (prevChar == '.' || prevChar == '!' || prevChar == '?') && !inQuote {
+                if unicode.IsSpace(rune(currChar)) {
+                    isAbbreviation := false
+                    for abbr := range sentenceAbbrevs {
+                        abbrLen := len(abbr)
+                        if i >= abbrLen && strings.HasSuffix(text[start:i], abbr) {
+                            isAbbreviation = true
+                            break
+                        }
+                    }
+                    if !isAbbreviation {
+                        sentence := text[start:i]
+                        if strings.TrimSpace(sentence) != "" {
+                            sentences = append(sentences, sentence)
+                        }
+                        start = i
+                    }
+                }
+            }
+        }
+    }
+
+    // Add remaining text
+    if start < len(text) {
+        remaining := text[start:]
+        if strings.TrimSpace(remaining) != "" {
+            sentences = append(sentences, remaining)
+        }
+    }
+
+    return sentences
+}
+func requiresWebSearch(userID, query string) (mode string, payload string, links []string, err error) {
+    // Get base prompt from config
+    basePrompt := cfg.GeminiPrompt()
+
+    // Build indexed summary list for this user
+    type summaryEntry struct {
+        ID      string
+        Content string
+    }
+    var userSummaries []summaryEntry
+
+    conversationMutex.Lock()
+    for key, messages := range conversations {
+        if strings.HasPrefix(key, "SUM_"+userID) {
+            cleanID := strings.TrimPrefix(key, "SUM_")
+            userSummaries = append(userSummaries, summaryEntry{
+                ID:      cleanID,
+                Content: messages[0].Content,
+            })
+        }
+    }
+    conversationMutex.Unlock()
+
+    // Format summaries with explicit IDs
+    var summaryStrings []string
+    for _, entry := range userSummaries {
+        summaryStrings = append(summaryStrings, 
+            fmt.Sprintf("Summary ID: %s\nContent: %s", entry.ID, entry.Content))
+    }
+
+    enhancedPrompt := fmt.Sprintf(`%s
+
+RESPONSE FORMATS (MUST USE ONE):
+1. Web search required:
+<question>your_rephrased_query</question>
+<links>optional_url1.com\noptional_url2.com</links>
+
+2. Memory recall required:
+<memory>EXACT_SUMMARY_ID_HERE</memory>
+
+3. No search needed:
+not_needed
+
+USER'S AVAILABLE SUMMARIES:
+%s
+
+CURRENT DATE: %s
+QUERY: %s`,
+        basePrompt,
+        strings.Join(summaryStrings, "\n\n---\n"),
+        time.Now().Format("2006-01-02"),
+        query)
+    // Prepare Gemini request
+    reqBody := struct {
+        Contents []struct {
+            Parts []struct {
+                Text string `json:"text"`
+            } `json:"parts"`
+        } `json:"contents"`
+    }{
+        Contents: []struct {
+            Parts []struct {
+                Text string `json:"text"`
+            } `json:"parts"`
+        }{
+            {
+                Parts: []struct {
+                    Text string `json:"text"`
+                }{
+                    {Text: enhancedPrompt},
+                },
+            },
+        },
+    }
+
+    bodyBytes, err := json.Marshal(reqBody)
+    if err != nil {
+        return "", "", nil, fmt.Errorf("error marshaling request: %v", err)
+    }
+
+    // Send request
+    geminiAPIURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent"
+    req, err := http.NewRequest("POST", geminiAPIURL, bytes.NewReader(bodyBytes))
+    if err != nil {
+        return "", "", nil, fmt.Errorf("error creating request: %v", err)
+    }
+
+    q := req.URL.Query()
+    q.Add("key", cfg.GeminiAPIKey())
+    req.URL.RawQuery = q.Encode()
+    req.Header.Set("Content-Type", "application/json")
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return "", "", nil, fmt.Errorf("error sending request: %v", err)
+    }
+    defer resp.Body.Close()
+
+    // Parse response
+    var geminiResp struct {
+        Candidates []struct {
+            Content struct {
+                Parts []struct {
+                    Text string `json:"text"`
+                } `json:"parts"`
+            } `json:"content"`
+        } `json:"candidates"`
+    }
+
+    if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
+        return "", "", nil, fmt.Errorf("error decoding response: %v", err)
+    }
+
+    if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
+        return "", "", nil, fmt.Errorf("empty response from Gemini")
+    }
+
+    responseText := geminiResp.Candidates[0].Content.Parts[0].Text
+
+    // Validate and parse response
+    switch {
+    case strings.Contains(responseText, "<memory>"):
+        requestedID := extractXMLTag(responseText, "memory")
+        // Verify the ID exists for this user
+        for _, s := range userSummaries {
+            if s.ID == requestedID {
+                return "memory", requestedID, nil, nil
+            }
+        }
+        return "", "", nil, fmt.Errorf("invalid summary ID: %s", requestedID)
+
+    case strings.Contains(responseText, "<question>"):
+        return "internet", 
+               extractXMLTag(responseText, "question"), 
+               parseLinks(responseText), 
+               nil
+
+    case strings.TrimSpace(responseText) == "not_needed":
+        return "none", "", nil, nil
+
+    default:
+        return "", "", nil, fmt.Errorf("invalid response format")
+    }
 }
 
-
-func callGemini(message string) (string, error) {
-	// Define the valid tags
-	validTags := []string{"Investigating model", "Asking for advice", "Talking about Time"}
-
-	// Define the Gemini API endpoint and API key
-	geminiAPIKey := "AIzaSyCYCs1nbDHOjTMvEI46V6hyEqIiJcwbKTY" // Replace with your actual API key
-	geminiAPIURL := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent"
-	geminiprompt := fmt.Sprintf(`You are a tag generator. Your task is to analyze the following message and determine if it matches any of these tags: "Investigating model", "Asking for advice", "Talking about Time". 
-- Only reply with tags if they are completely relevant to the message.
-- If no tags are relevant, reply with "NONE".
-- Format the tags as a comma-separated list without spaces or newlines (e.g., "Investigating model,Asking for advice").
-Here is the message: %s`, message)
-	// Prepare the request body
-	reqBody := GenerateRequest{
-		Contents: []Content{
-			{
-				Parts: []Part{
-					{Text: fmt.Sprintf(`%s%s`, geminiprompt, message)},
-				},
-			},
-		},
-	}
-
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("error marshaling request body: %v", err)
-	}
-
-	// Create the HTTP request
-	req, err := http.NewRequest("POST", geminiAPIURL, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", fmt.Errorf("error creating request: %v", err)
-	}
-
-	// Add API key as URL parameter
-	q := req.URL.Query()
-	q.Add("key", geminiAPIKey)
-	req.URL.RawQuery = q.Encode()
-
-	req.Header.Set("Content-Type", "application/json")
-
-	// Send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("error sending request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	// Check for API errors
-	if resp.StatusCode != http.StatusOK {
-		errorBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API returned non-200 status: %s, body: %s", resp.Status, string(errorBody))
-	}
-
-	// Decode the response
-	var geminiResp GenerateResponse
-	if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
-		return "", fmt.Errorf("error decoding response: %v", err)
-	}
-
-	// Log the full response for debugging
-	responseBytes, _ := json.MarshalIndent(geminiResp, "", "  ")
-	fmt.Printf("Full Gemini API response: %s\n", string(responseBytes))
-
-	// Extract the response text
-	if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
-		return "", fmt.Errorf("no content in response")
-	}
-	responseText := geminiResp.Candidates[0].Content.Parts[0].Text
-
-	// Normalize the response text (remove newlines, trim spaces, etc.)
-	responseText = strings.TrimSpace(responseText)
-	responseText = strings.ReplaceAll(responseText, "\n", ", ") // Replace newlines with commas
-	responseText = strings.ReplaceAll(responseText, "  ", " ")  // Remove extra spaces
-
-	// Split the response into individual tags
-	tags := strings.Split(responseText, ", ")
-
-	// Check if any of the tags are valid
-	for _, tag := range tags {
-		for _, validTag := range validTags {
-			if strings.EqualFold(tag, validTag) { // Case-insensitive comparison
-				return tag, nil // Return the valid tag
-			}
-		}
-	}
-
-	// If no valid tag is found, return an empty string
-	return "", nil
+// Helper functions
+func extractXMLTag(input, tag string) string {
+    re := regexp.MustCompile(fmt.Sprintf(`<%s>(.*?)</%s>`, tag, tag))
+    matches := re.FindStringSubmatch(input)
+    if len(matches) > 1 {
+        return strings.TrimSpace(matches[1])
+    }
+    return ""
 }
+
+func parseLinks(response string) []string {
+    linksRegex := regexp.MustCompile(`(?s)<links>(.*?)</links>`)
+    linksMatch := linksRegex.FindStringSubmatch(response)
+    if len(linksMatch) < 2 {
+        return nil
+    }
+    return strings.Split(strings.TrimSpace(linksMatch[1]), "\n")
+}
+func parseGeminiResponse(response string) (string, []string) {
+    // Debug print raw response
+
+    // Extract <question> block
+    questionRegex := regexp.MustCompile(`(?s)<question>(.*?)</question>`)
+    questionMatch := questionRegex.FindStringSubmatch(response)
+    var question string
+    if len(questionMatch) >= 2 {
+        question = strings.TrimSpace(questionMatch[1])
+    } else {
+        return "not_needed", nil
+    }
+
+    // Debug parsed question
+
+    // Extract <links> block (if exists)
+    linksRegex := regexp.MustCompile(`(?s)<links>(.*?)</links>`)
+    linksMatch := linksRegex.FindStringSubmatch(response)
+    var links []string
+    
+    if len(linksMatch) >= 2 {
+        rawLinks := strings.TrimSpace(linksMatch[1])
+        links = strings.Split(rawLinks, "\n")
+        // Clean up each link
+        for i, link := range links {
+            links[i] = strings.TrimSpace(link)
+        }
+    }
+
+
+    return question, links
+}
+
 func processChat(userID, userInput string) string {
-	conversationMutex.Lock()
-	defer conversationMutex.Unlock()
+    sessionMux.Lock()
+    session, exists := sessions[userID]
+    if !exists || !session.Active {
+        // Create new session
+        now := time.Now().Unix()
+        seq := 1
+        if exists {
+            seq = session.UserTotalSessions + 1
+        }
+        session = &UserSession{
+            ID:                fmt.Sprintf("%s#S%d-%d", userID, now, seq),
+            Active:            true,
+            UserTotalSessions: seq,
+            LastSessionTime:   now,
+        }
+        sessions[userID] = session
+    }
+    // Reset timer
+    if session.Timer != nil {
+        session.Timer.Stop()
+    }
+    session.Timer = time.AfterFunc(SessionTimeout, func() {
+        expireSession(userID)
+    })
+    sessionMux.Unlock()
 
-	// Check for slash commands anywhere in the input
-	ok, result := parseSlashCommand(userInput)
-	if ok {
-		// Handle reset command
-		if result.resetConversation {
-			resetConversation(userID)
-			initConversation("Config")
-			return "Conversation reset."
-		}
-		// Handle toggle debug mode command
-		if result.toggleDebugMode {
-			cfg = cfg.WithDebugMode(!cfg.IsDebugMode())
-			module.UpdateConfig(cfg)
-			if cfg.IsDebugMode() {
-				return "Debug mode is now enabled."
-			} else {
-				return "Debug mode is now disabled."
-			}
-		}
-		// Handle toggle supervised mode command
-		if result.toggleSupervisedMode {
-			cfg = cfg.WithSupervisedMode(!cfg.IsSupervisedMode())
-			module.UpdateConfig(cfg)
-			if cfg.IsSupervisedMode() {
-				return "Supervised mode is now enabled."
-			} else {
-				return "Supervised mode is now disabled."
-			}
-		}
-		// If there's a prompt to send to the AI, use it
-		if result.prompt != "" {
-			userInput = result.prompt
-		} else {
-			// If the command does not result in a prompt, return immediately
-			return "Command executed."
-		}
-	}
+    // 2. Store message with conversation mutex
+    conversationMutex.Lock()
+    conversations[session.ID] = append(conversations[session.ID], openai.ChatCompletionMessage{
+        Role:    openai.ChatMessageRoleUser,
+        Content: userInput,
+    })
+    conversationMutex.Unlock()
 
-	// If no command was detected, or we have a prompt to send to the AI, proceed with normal processing
-	appendMessage(userID, openai.ChatMessageRoleUser, userInput)
-	fmt.Println("Appended message to user: ", userID)
-	if strings.Contains(userID, "decision") {
-		usermemID := strings.Replace(userID, "decision#", "", 1)
-		appendMessage(usermemID, openai.ChatMessageRoleUser, strings.Split(userInput, "\n")[0])
-		fmt.Println("Appended message to user", usermemID, "not responding tho:", strings.Split(userInput, "\n")[0])
-	}
-	var combinedSlice []openai.ChatCompletionMessage
-	if strings.Contains(userID, "monitor") {
-		// If userID starts with "monitor", combinedSlice is only conversations[userID]
-		combinedSlice = conversations[userID]
-	} else if strings.Contains(userID, "decision") {
-		// If userID starts with "instruct", combinedSlice is the appended slice of conversations["nolist"] and conversations[userID]
-		combinedSlice = append(conversations["decision"], conversations[userID]...)
-	} else {
-		// Otherwise, combinedSlice is the appended slice of conversations["Config"] and conversations[userID]
-		combinedSlice = append(conversations["Config"], conversations[userID]...)
-	}
-	if (false) {
-		// Call Gemini to get tags for the user input
-		tags, err := callGemini(userInput)
-		if err != nil {
-			fmt.Printf("Error calling Gemini: %v\n", err)
-		} else if tags != "" {
-			// Split the tags into a slice (if multiple tags are returned)
-			tagList := strings.Split(tags, ", ") // Adjust the delimiter if needed
+    ctx := buildContext(userID)
 
-			// Iterate over the tags
-			for _, tag := range tagList {
-				fmt.Printf("Gemini tag: %s\n", tag)
+    // 3. Handle decision/monitor logic with session.ID
+    // 5. Handle decision/monitor logic if needed
+    if strings.Contains(userID, "decision") {
+        usermemID := strings.Replace(userID, "decision#", "", 1)
+        appendMessage(usermemID, openai.ChatMessageRoleUser, strings.Split(userInput, "\n")[0])
+    }
+     
+    // 4. Build context using base userID (extracted from session.ID)
 
-				// Check if the tag exists in conversations
-				if conv, ok := conversations[tag]; ok {
-					// Append the conversation history for the tag to combinedSlice
-					fmt.Printf("Appending this tag: %s\n", tag)
-					combinedSlice = append(combinedSlice, conv...)
-				}
-			}
-		} else {
-			fmt.Println("No valid tags found for the message.")
-		}
-	}
+
+
+        internetContext := ""
+
+        mode, payload, links, err := requiresWebSearch(userID, userInput)
+        fmt.Println(mode)
+        if err != nil {
+                log.Printf("Search decision failed: %v", err)
+                // internetContext remains empty
+        } else {
+                switch mode {
+                case "internet":
+                        // Get search results
+                        searchContents, err := callSearxng(payload, links)
+                        if err != nil {
+                                log.Printf("Search failed: %v", err)
+                        } else {
+                                // Format results into internetContext
+                                var builder strings.Builder
+                                builder.WriteString("Web search results:\n")
+                                for i, content := range searchContents {
+                                        builder.WriteString(fmt.Sprintf("%d. %s\n", i+1, content))
+                                }
+                                internetContext = builder.String()
+                        }
+                case "memory":
+                        conversationMutex.Lock()
+                        if messages, exists := conversations[payload]; exists {
+                                var builder strings.Builder
+                                builder.WriteString("Complete conversation history:\n")
+                                for _, msg := range messages {
+                                        builder.WriteString(fmt.Sprintf("%s: %s\n", msg.Role, msg.Content))
+                                }
+                                internetContext = builder.String()
+                        }
+                        conversationMutex.Unlock()
+                case "none":
+                        log.Println("No search needed for this query")
+                default:
+                        log.Printf("Unknown search mode: %s", mode)
+                }
+        }
 	// Call TogetherAI's API directly
-	// Call TogetherAI's API directly
+	messages := make([]openai.ChatCompletionMessage, len(ctx))
+	copy(messages, ctx)
+
+	if internetContext != "" {
+		messages = append(
+			[]openai.ChatCompletionMessage{
+				{
+					Role:    openai.ChatMessageRoleSystem,
+					Content: internetContext,
+				},
+			},
+			messages...,
+		)
+	}
+
 	reqBody := struct {
 		Model    string                         `json:"model"`
 		Messages []openai.ChatCompletionMessage `json:"messages"`
 		Stream   bool                           `json:"stream"`
 	}{
-		Model:    cfg.OpenAIAPIModel(), // Use the model from cfg
-		Messages: combinedSlice,
-		Stream:   false, // Set to true if you want streaming
+		Model:    cfg.OpenAIAPIModel(),
+		Messages: messages,
+		Stream:   false,
 	}
 	bodyBytes, _ := json.Marshal(reqBody)
 	req, _ := http.NewRequest("POST", "https://api.together.ai/v1/chat/completions", bytes.NewReader(bodyBytes))
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIAPIKey()) // Use the API key from cfg
 	req.Header.Set("Content-Type", "application/json")
-
 	// Send the request
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -394,7 +1143,7 @@ func processChat(userID, userInput string) string {
 		}
 	}
 	defer resp.Body.Close()
-
+	fmt.Println("Made it 3")
 	// Decode the response
 	var apiResult struct {
 		Choices []struct {
@@ -410,18 +1159,38 @@ func processChat(userID, userInput string) string {
 	if len(apiResult.Choices) == 0 {
 		return "No response from AI"
 	}
+	fmt.Println("Made it 4")
+// Append AI response to conversation
+        response := apiResult.Choices[0].Message.Content
+	fmt.Printf("[DEBUG] Timer reset after AI reply to %s\n", userID)
+        // Try to reformat, with multiple fallback checks
+        var finalResponse string
+        formResponse, err := reformatTextWithGemini(response)
+        switch {
+        case err != nil:
+            log.Printf("Reformatting error: %v - Using original text", err)
+            finalResponse = response
+        case len(strings.TrimSpace(formResponse)) == 0:
+            log.Printf("Reformatting returned empty - Using original text")
+            finalResponse = response
+        case shouldUseOriginal(response, formResponse): // 80% similarity threshold
+            log.Printf("Reformatting changed meaning Using original text")
+            fmt.Println("The modified was...: ", formResponse)
+            finalResponse = response
+        default:
+            finalResponse = formResponse
+        }
 
-	// Append AI response to conversation
-	response := apiResult.Choices[0].Message.Content
-	formResponse, err := reformatTextWithGemini(response)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-	}
-	fmt.Println("Reformatted text:", formResponse)
-	response = formResponse
-	appendMessage(userID, openai.ChatMessageRoleAssistant, cleanContent(response))
-
-	return response
+        // Clean and append (applies to both reformatted and fallback responses)
+        //cleanResponse := cleanContent(finalResponse)
+    // 8. Store AI response (with proper mutex)
+        conversationMutex.Lock()
+	conversations[session.ID] = append(conversations[session.ID], openai.ChatCompletionMessage{
+        	Role:    openai.ChatMessageRoleAssistant,
+        	Content: finalResponse,
+    	})
+    	conversationMutex.Unlock()
+	return finalResponse
 }
 func handleAPIError(err error) string {
 	if strings.Contains(err.Error(), "429") {
@@ -530,129 +1299,10 @@ type ErrorResponse struct {
 	} `json:"error"`
 }
 
-// New handler for /perplex endpoint
-func perplexHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// // Step 1: Validate API key
-	// apiKey := r.Header.Get("Authorization")
-	// expectedAPIKey := "tgp_v1__-HQ6sSoDvqekjFYTBud0VWCG9H5VGmDZbGvTCiPLQI" // Replace with your actual API key
-	// if apiKey == "" || !strings.HasPrefix(apiKey, "Bearer ") || apiKey[7:] != expectedAPIKey {
-	// 	errorResponse := ErrorResponse{
-	// 		Error: struct {
-	// 			Message string  `json:"message"`
-	// 			Type    string  `json:"type"`
-	// 			Param   *string `json:"param"`
-	// 			Code    string  `json:"code"`
-	// 		}{
-	// 			Message: "Invalid API key provided. You can find your API key at https://api.together.xyz/settings/api-keys.",
-	// 			Type:    "invalid_request_error",
-	// 			Param:   nil,
-	// 			Code:    "invalid_api_key",
-	// 		},
-	// 	}
-	// 	w.Header().Set("Content-Type", "application/json")
-	// 	w.WriteHeader(http.StatusUnauthorized)
-	// 	json.NewEncoder(w).Encode(errorResponse)
-	// 	return
-	// }
-
-	// Step 2: Parse the request body
-	var gptReq GPTRequest
-	if err := json.NewDecoder(r.Body).Decode(&gptReq); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	// Step 3: Call TogetherAI's API directly
-	reqBody := struct {
-		Model    string                         `json:"model"`
-		Messages []openai.ChatCompletionMessage `json:"messages"`
-		Stream   bool                           `json:"stream"`
-	}{
-		Model:    gptReq.Model, // Use the model from the request
-		Messages: gptReq.Messages,
-		Stream:   false, // Set to true if you want streaming
-	}
-
-	bodyBytes, err := json.Marshal(reqBody)
-	if err != nil {
-		http.Error(w, "Error marshaling request body", http.StatusInternalServerError)
-		return
-	}
-
-	req, err := http.NewRequest("POST", "https://api.together.ai/v1/chat/completions", bytes.NewReader(bodyBytes))
-	if err != nil {
-		http.Error(w, "Error creating request", http.StatusInternalServerError)
-		return
-	}
-
-	req.Header.Set("Authorization", "Bearer tgp_v1__-HQ6sSoDvqekjFYTBud0VWCG9H5VGmDZbGvTCiPLQI") // Use the API key from cfg
-	req.Header.Set("Content-Type", "application/json")
-	log.Println(gptReq.Messages)
-	// Send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		if strings.Contains(err.Error(), "429") {
-			time.Sleep(time.Second) // Retry after rate limit
-			resp, err = client.Do(req)
-		}
-		if err != nil {
-			http.Error(w, "Aww shoot! Be back in like an hour, gotta check on something.", http.StatusInternalServerError)
-			return
-		}
-	}
-	defer resp.Body.Close()
-
-	// Check for API errors
-	if resp.StatusCode != http.StatusOK {
-		var errorResponse ErrorResponse
-		if err := json.NewDecoder(resp.Body).Decode(&errorResponse); err != nil {
-			http.Error(w, "Error decoding error response", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		json.NewEncoder(w).Encode(errorResponse)
-		return
-	}
-
-	// Decode the response
-	var apiResult struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		Model   string `json:"model"`
-		Choices []struct {
-			Index        int                          `json:"index"`
-			Message      openai.ChatCompletionMessage `json:"message"`
-			FinishReason string                       `json:"finish_reason"`
-		} `json:"choices"`
-		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
-		} `json:"usage"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&apiResult); err != nil {
-		http.Error(w, "Error decoding API response", http.StatusInternalServerError)
-		return
-	}
-
-	// Step 4: Return the response in the same JSON format as the regular GPT API
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(apiResult)
-}
-
 func startServer() {
 	http.HandleFunc("/chat", chatHandler)
 	http.HandleFunc("/reset", resetHandler)
 	http.HandleFunc("/config", configHandler)
-	http.HandleFunc("/perplex/chat/completions", perplexHandler) // Add the new endpoint
 	fmt.Println("Starting server on :8087")
 	http.ListenAndServe(":8087", nil)
 }
